@@ -1,13 +1,11 @@
 import os, time, requests
-from datetime import datetime
+from datetime import datetime, timezone
 
-# === SOZLAMALAR ===
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
-CHECK_INTERVAL = 300  # 5 daqiqa (soniya)
+CHECK_INTERVAL = 300  # 5 daqiqa
 
 def get_gold_price():
-    """Yahoo Finance dan XAUUSD narxini olish"""
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -15,12 +13,14 @@ def get_gold_price():
         data = r.json()
         price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
         prev  = data["chart"]["result"][0]["meta"]["previousClose"]
-        return float(price), float(prev)
-    except:
-        return None, None
+        high  = data["chart"]["result"][0]["meta"].get("regularMarketDayHigh", price)
+        low   = data["chart"]["result"][0]["meta"].get("regularMarketDayLow", price)
+        return float(price), float(prev), float(high), float(low)
+    except Exception as e:
+        print(f"Narx olishda xato: {e}")
+        return None, None, None, None
 
 def calc_rsi(prices, period=14):
-    """RSI hisoblash"""
     if len(prices) < period + 1:
         return 50
     gains, losses = [], []
@@ -35,60 +35,78 @@ def calc_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 1)
 
-def get_signal(price, prev_price, rsi):
-    """Signal aniqlash"""
-    change_pct = ((price - prev_price) / prev_price) * 100
+def calc_atr(highs, lows, closes, period=14):
+    if len(closes) < 2:
+        return 2.0
+    trs = []
+    for i in range(1, min(len(closes), period+1)):
+        hl  = highs[i] - lows[i] if i < len(highs) else 2.0
+        hpc = abs(highs[i] - closes[i-1]) if i < len(highs) else 2.0
+        lpc = abs(lows[i] - closes[i-1]) if i < len(lows) else 2.0
+        trs.append(max(hl, hpc, lpc))
+    return round(sum(trs) / len(trs), 2) if trs else 2.0
 
-    score_buy  = 0
-    score_sell = 0
+def calc_lot(balance, risk_pct, sl_dist):
+    risk_amt = balance * risk_pct / 100
+    # XAUUSD: 1 lot = 100 oz, pip = $0.01 => pip value = $1 per 0.01 lot
+    pip_value = 1.0  # $1 per pip per 0.01 lot
+    sl_pips   = sl_dist / 0.1
+    lot = risk_amt / (sl_pips * pip_value * 10)
+    lot = round(max(0.01, min(5.0, lot)), 2)
+    return lot, round(risk_amt, 2)
+
+def get_signal(price, prev, rsi, atr, high_day, low_day):
+    change_pct = ((price - prev) / prev) * 100
+    buy_score  = 0
+    sell_score = 0
     reasons    = []
 
     # RSI
     if rsi < 35:
-        score_buy += 2
-        reasons.append(f"RSI={rsi} (oversold)")
+        buy_score += 2
+        reasons.append(f"RSI={rsi} ⬇ Oversold")
     elif rsi > 65:
-        score_sell += 2
-        reasons.append(f"RSI={rsi} (overbought)")
+        sell_score += 2
+        reasons.append(f"RSI={rsi} ⬆ Overbought")
     else:
-        reasons.append(f"RSI={rsi} (neytral)")
+        reasons.append(f"RSI={rsi} neytral")
 
     # Narx o'zgarishi
-    if change_pct < -0.3:
-        score_sell += 1
-        reasons.append(f"Narx -{abs(change_pct):.2f}% tushgan")
-    elif change_pct > 0.3:
-        score_buy += 1
+    if change_pct <= -0.3:
+        sell_score += 1
+        reasons.append(f"Narx {change_pct:.2f}% tushgan")
+    elif change_pct >= 0.3:
+        buy_score += 1
         reasons.append(f"Narx +{change_pct:.2f}% o'sgan")
 
-    # Vaqt filtri (Lonon/NY sessiya)
-    hour = datetime.utcnow().hour
+    # Kun ichidagi pozitsiya
+    day_range = high_day - low_day
+    if day_range > 0:
+        pos = (price - low_day) / day_range
+        if pos < 0.25:
+            buy_score += 1
+            reasons.append("Kun pastiga yaqin")
+        elif pos > 0.75:
+            sell_score += 1
+            reasons.append("Kun yuqorisiga yaqin")
+
+    # Sessiya filtri (London/NY: 07-17 UTC)
+    hour = datetime.now(timezone.utc).hour
     if 7 <= hour <= 17:
-        score_buy  += 1
-        score_sell += 1
-        reasons.append("Aktiv sessiya (07-17 UTC)")
+        reasons.append("✅ Aktiv sessiya")
     else:
-        reasons.append("⚠️ Sessiya tashqarisida")
+        reasons.append("⚠️ Sessiya tashqarisi")
+        buy_score  = max(0, buy_score - 1)
+        sell_score = max(0, sell_score - 1)
 
     # Qaror
-    if score_buy >= 3:
-        signal = "BUY"
-    elif score_sell >= 3:
-        signal = "SELL"
-    else:
-        signal = "KUTING"
-
-    return signal, score_buy, score_sell, reasons
-
-def calc_lot(balance, risk_pct, sl_pips):
-    """Lot hisoblash"""
-    risk_amt = balance * risk_pct / 100
-    pip_val  = 10  # XAUUSD 1 pip = $10 (1 lot)
-    lot = risk_amt / (sl_pips * pip_val)
-    return round(max(0.01, min(5.0, lot)), 2)
+    if buy_score >= 3 and buy_score > sell_score:
+        return "BUY", buy_score, sell_score, reasons
+    elif sell_score >= 3 and sell_score > buy_score:
+        return "SELL", buy_score, sell_score, reasons
+    return "KUTING", buy_score, sell_score, reasons
 
 def send_telegram(message):
-    """Telegram xabar yuborish"""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Telegram sozlanmagan!")
         return False
@@ -100,85 +118,109 @@ def send_telegram(message):
     }, timeout=10)
     return r.status_code == 200
 
-def format_signal_message(signal, price, prev, rsi, reasons):
-    """Signal xabarini formatlash"""
+def format_message(signal, price, prev, rsi, atr, reasons, balance=1000, risk_pct=1.0):
     change     = price - prev
     change_pct = (change / prev) * 100
     change_str = f"+{change:.2f}" if change >= 0 else f"{change:.2f}"
+    time_now   = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
-    # SL/TP hisoblash
-    sl_pips = 25
-    tp_pips = 40
+    # SL va TP hisoblash (ATR asosida)
+    sl_mult = 1.5
+    tp_mult = 2.5
+    sl_dist = round(atr * sl_mult, 2)
+    tp_dist = round(atr * tp_mult, 2)
+
     if signal == "BUY":
-        sl_price = round(price - sl_pips * 0.1, 2)
-        tp_price = round(price + tp_pips * 0.1, 2)
+        sl_price = round(price - sl_dist, 2)
+        tp1      = round(price + tp_dist * 0.6, 2)
+        tp2      = round(price + tp_dist, 2)
+        tp3      = round(price + tp_dist * 1.5, 2)
         emoji    = "📈"
-        sig_text = "BUY (SOTIB OL)"
-    elif signal == "SELL":
-        sl_price = round(price + sl_pips * 0.1, 2)
-        tp_price = round(price - tp_pips * 0.1, 2)
-        emoji    = "📉"
-        sig_text = "SELL (SOT)"
+        sig_text = "BUY — SOTIB OL"
+        direction = "⬆️"
     else:
-        sl_price = round(price - sl_pips * 0.1, 2)
-        tp_price = round(price + tp_pips * 0.1, 2)
-        emoji    = "⏸"
-        sig_text = "KUTING"
+        sl_price = round(price + sl_dist, 2)
+        tp1      = round(price - tp_dist * 0.6, 2)
+        tp2      = round(price - tp_dist, 2)
+        tp3      = round(price - tp_dist * 1.5, 2)
+        emoji    = "📉"
+        sig_text = "SELL — SOT"
+        direction = "⬇️"
 
-    # Lot (demo: $1000 balans, 1% risk)
-    lot    = calc_lot(1000, 1.0, sl_pips)
-    margin = round(lot * 100 * price / 100, 2)
-    profit = round(lot * tp_pips * 10, 2)
-    loss   = round(lot * sl_pips * 10, 2)
+    sl_pips = round(sl_dist / 0.1)
+    tp_pips = round(tp_dist / 0.1)
+    rr      = round(tp_pips / sl_pips, 1)
+
+    lot, risk_amt = calc_lot(balance, risk_pct, sl_dist)
+    margin  = round(lot * 100 * price / 100, 2)
+    profit1 = round(lot * tp_pips * 0.6 * 1.0, 2)
+    profit2 = round(lot * tp_pips * 1.0, 2)
+    loss    = round(risk_amt, 2)
 
     reasons_text = "\n".join([f"  • {r}" for r in reasons])
-    time_now     = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
 
-    msg = f"""{emoji} <b>XAUUSD SIGNALI — {sig_text}</b>
-🕐 <b>Vaqt:</b> {time_now}
+    msg = f"""{emoji} <b>XAUUSD SIGNALI — {sig_text}</b> {direction}
+🕐 <b>Vaqt:</b> {time_now} | M5
 ━━━━━━━━━━━━━━━━━━━━
-💰 <b>Narx:</b>   <code>{price:.2f}</code>  ({change_str}, {change_pct:.2f}%)
-🛑 <b>SL:</b>     <code>{sl_price:.2f}</code>  (-{sl_pips} pip)
-✅ <b>TP:</b>     <code>{tp_price:.2f}</code>  (+{tp_pips} pip)
-⚖️  <b>R:R:</b>   1:{round(tp_pips/sl_pips, 1)}
+💰 <b>Kirish narxi:</b>  <code>{price:.2f}</code>
+   ({change_str} | {change_pct:+.2f}%)
 ━━━━━━━━━━━━━━━━━━━━
-📦 <b>Lot:</b>    <code>{lot}</code>  ($1000 / 1% risk)
-🏦 <b>Marja:</b>  <code>${margin}</code>
-📊 <b>Foyda:</b>  <code>+${profit}</code>
-⚠️  <b>Zarar:</b>  <code>-${loss}</code>
+🛑 <b>Stop Loss:</b>    <code>{sl_price:.2f}</code>  (-{sl_pips} pip)
+━━━━━━━━━━━━━━━━━━━━
+✅ <b>Take Profit 1:</b> <code>{tp1:.2f}</code>  (+{round(tp_pips*0.6)} pip)
+✅ <b>Take Profit 2:</b> <code>{tp2:.2f}</code>  (+{tp_pips} pip)
+✅ <b>Take Profit 3:</b> <code>{tp3:.2f}</code>  (+{round(tp_pips*1.5)} pip)
+⚖️  <b>R:R nisbat:</b>   1:{rr}
+━━━━━━━━━━━━━━━━━━━━
+📦 <b>Lot size:</b>     <code>{lot}</code>
+🏦 <b>Marja:</b>        <code>${margin}</code>
+📊 <b>Foyda (TP1):</b>  <code>+${profit1}</code>
+📊 <b>Foyda (TP2):</b>  <code>+${profit2}</code>
+⚠️  <b>Max zarar:</b>   <code>-${loss}</code>
 ━━━━━━━━━━━━━━━━━━━━
 📡 <b>Sabablar:</b>
 {reasons_text}
 ━━━━━━━━━━━━━━━━━━━━
-<i>⚡ Avtomatik signal | Exness da qo'lda oching</i>"""
+📊 RSI: {rsi} | ATR: {atr}
+<i>⚡ Exness da qo'lda oching | $1000 / 1% risk</i>"""
     return msg
 
 # === ASOSIY TSIKL ===
-last_signal   = ""
 price_history = []
+high_history  = []
+low_history   = []
+last_signal   = ""
 
 print("🚀 XAUUSD Signal Bot ishga tushdi!")
-send_telegram("🚀 <b>XAUUSD Signal Bot ishga tushdi!</b>\n⏱ Har 5 daqiqada signal tekshiriladi.")
+send_telegram("🚀 <b>XAUUSD Signal Bot ishga tushdi!</b>\n⏱ Har 5 daqiqada signal tekshiriladi.\n📊 SL, TP1, TP2, TP3 va Lot size beriladi.")
 
 while True:
     try:
-        price, prev = get_gold_price()
+        price, prev, high, low = get_gold_price()
 
         if price and prev:
             price_history.append(price)
+            high_history.append(high)
+            low_history.append(low)
+
             if len(price_history) > 50:
                 price_history = price_history[-50:]
+                high_history  = high_history[-50:]
+                low_history   = low_history[-50:]
 
             rsi = calc_rsi(price_history)
-            signal, buy_score, sell_score, reasons = get_signal(price, prev, rsi)
+            atr = calc_atr(high_history, low_history, price_history)
 
-            print(f"[{datetime.utcnow().strftime('%H:%M')}] Narx: {price:.2f} | RSI: {rsi} | Signal: {signal}")
+            signal, buy_sc, sell_sc, reasons = get_signal(
+                price, prev, rsi, atr, high, low)
 
-            # Faqat signal o'zgarganda yuborish
+            now = datetime.now(timezone.utc).strftime('%H:%M')
+            print(f"[{now}] Narx: {price:.2f} | RSI: {rsi} | ATR: {atr} | Signal: {signal} (B:{buy_sc} S:{sell_sc})")
+
             if signal != "KUTING" and signal != last_signal:
-                msg = format_signal_message(signal, price, prev, rsi, reasons)
+                msg = format_message(signal, price, prev, rsi, atr, reasons)
                 if send_telegram(msg):
-                    print(f"✅ Telegram ga yuborildi: {signal}")
+                    print(f"✅ Telegram: {signal} signali yuborildi!")
                 last_signal = signal
 
         time.sleep(CHECK_INTERVAL)
